@@ -323,6 +323,7 @@ const generateSupabaseSignedUploadUrl = async (bucket, objectPath) => {
       "apikey": serviceRoleKey,
       "Content-Type": "application/json",
     },
+    body: JSON.stringify({}),
   });
 
   if (!response.ok) {
@@ -334,7 +335,9 @@ const generateSupabaseSignedUploadUrl = async (bucket, objectPath) => {
   const uploadRelative = data.url || data.signedURL || data.signedUrl;
   const fullUploadUrl = uploadRelative.startsWith("http")
     ? uploadRelative
-    : `${cleanBase}${uploadRelative.startsWith("/") ? "" : "/"}${uploadRelative}`;
+    : `${cleanBase}/storage/v1${
+        uploadRelative.startsWith("/") ? "" : "/"
+      }${uploadRelative}`;
 
   return {
     success: true,
