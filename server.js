@@ -292,7 +292,9 @@ const generateSupabaseSignedUrl = async (bucket, objectPath, expiresIn = 300) =>
   const signedRelative = data.signedURL || data.signedUrl;
   const fullSignedUrl = signedRelative.startsWith("http")
     ? signedRelative
-    : `${cleanBase}${signedRelative.startsWith("/") ? "" : "/"}${signedRelative}`;
+    : `${cleanBase}/storage/v1${
+        signedRelative.startsWith("/") ? "" : "/"
+      }${signedRelative}`;
 
   return {
     success: true,
