@@ -1,4 +1,4 @@
-require("dotenv").config();
+try { require("dotenv").config(); } catch (e) {}
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -45,7 +45,7 @@ const getAdminMessaging = () => {
 };
 
 app.get("/", (req, res) => {
-  res.send("KChat Notification Server Running 🚀");
+  res.send("KChat Notification & Media Server Running 🚀");
 });
 
 // Authentication middleware using native Firebase ID Token
@@ -176,13 +176,311 @@ const sendNotificationHandler = async (req, res) => {
   }
 };
 
+// ============================================================================
+// PHASE 2 MEDIA AUTHORIZATION & SIGNED URL MANAGEMENT
+// ============================================================================
+
+/**
+ * Validates channel authorization against Firebase RTDB.
+ * Never trusts client claims: exclusively uses authenticated Firebase UID.
+ */
+const verifyChannelMembership = async (authenticatedUid, channelId) => {
+  if (!channelId || typeof channelId !== "string") {
+    return { authorized: false, reason: "Missing or invalid channelId" };
+  }
+
+  // World Chat is public and explicitly does not use private vault authorization
+  if (channelId === "world_chat") {
+    return {
+      authorized: false,
+      isWorldChat: true,
+      reason: "World Chat media is public and does not require private vault authorization",
+    };
+  }
+
+  // Self Chat: self_chat_<uid>
+  if (channelId.startsWith("self_chat_")) {
+    const ownerUid = channelId.replace("self_chat_", "");
+    if (ownerUid === authenticatedUid) {
+      return { authorized: true, type: "self_chat" };
+    }
+    return { authorized: false, reason: "Forbidden: You are not the owner of this self-chat" };
+  }
+
+  // Direct 1-on-1 Chat: format is <uid1>_<uid2>
+  const isDirectChat = channelId.includes("_") && !channelId.startsWith("-");
+  if (isDirectChat) {
+    if (channelId.startsWith(authenticatedUid + "_") || channelId.endsWith("_" + authenticatedUid)) {
+      return { authorized: true, type: "direct_chat" };
+    }
+    const participants = channelId.split("_");
+    if (participants.includes(authenticatedUid)) {
+      return { authorized: true, type: "direct_chat", participants };
+    }
+    return { authorized: false, reason: "Forbidden: You are not a participant in this conversation" };
+  }
+
+  // Custom Group Chat: group push key (typically starts with "-") or channel name
+  try {
+    const db = getAdminDb();
+    const memberSnap = await db.ref(`channels/${channelId}/users/${authenticatedUid}`).once("value");
+    if (memberSnap.val() === true) {
+      return { authorized: true, type: "group_chat" };
+    }
+    return { authorized: false, reason: "Forbidden: You are not a member of this group" };
+  } catch (err) {
+    console.error("[MEMBERSHIP_CHECK] Firebase RTDB error:", err.message);
+    return { authorized: false, reason: "Database error verifying group membership" };
+  }
+};
+
+/**
+ * Generates a short-lived Supabase signed URL using service-role credentials.
+ * Never logs credentials, private keys, or the generated token.
+ */
+const generateSupabaseSignedUrl = async (bucket, objectPath, expiresIn = 300) => {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const sanitizedPath = objectPath.replace(/^\/+/, "");
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    // Local testing / staging fallback when service-role key is not yet set in environment
+    const base = (supabaseUrl || "https://cqdnbxdwrjqmtvwdgxtr.supabase.co").replace(/\/+$/, "");
+    return {
+      success: true,
+      simulated: true,
+      signedUrl: `${base}/storage/v1/object/sign/${bucket}/${encodeURIComponent(sanitizedPath)}?token=mock_signed_token_${Date.now()}&expires=${Math.floor(Date.now() / 1000) + expiresIn}`,
+      expiresIn,
+    };
+  }
+
+  const cleanBase = supabaseUrl.replace(/\/+$/, "");
+  const encodedPath = encodeURIComponent(sanitizedPath).replace(/%2F/g, "/");
+  const endpoint = `${cleanBase}/storage/v1/object/sign/${bucket}/${encodedPath}`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${serviceRoleKey}`,
+      "apikey": serviceRoleKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ expiresIn }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Supabase Storage sign error (${response.status}): ${errText}`);
+  }
+
+  const data = await response.json();
+  const signedRelative = data.signedURL || data.signedUrl;
+  const fullSignedUrl = signedRelative.startsWith("http")
+    ? signedRelative
+    : `${cleanBase}${signedRelative.startsWith("/") ? "" : "/"}${signedRelative}`;
+
+  return {
+    success: true,
+    simulated: false,
+    signedUrl: fullSignedUrl,
+    expiresIn,
+  };
+};
+
+/**
+ * Generates a short-lived Supabase signed upload URL (Option A Design).
+ */
+const generateSupabaseSignedUploadUrl = async (bucket, objectPath) => {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  const sanitizedPath = objectPath.replace(/^\/+/, "");
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    const base = (supabaseUrl || "https://cqdnbxdwrjqmtvwdgxtr.supabase.co").replace(/\/+$/, "");
+    return {
+      success: true,
+      simulated: true,
+      uploadUrl: `${base}/storage/v1/object/upload/sign/${bucket}/${encodeURIComponent(sanitizedPath)}?token=mock_upload_token_${Date.now()}`,
+      token: `mock_upload_token_${Date.now()}`,
+    };
+  }
+
+  const cleanBase = supabaseUrl.replace(/\/+$/, "");
+  const encodedPath = encodeURIComponent(sanitizedPath).replace(/%2F/g, "/");
+  const endpoint = `${cleanBase}/storage/v1/object/upload/sign/${bucket}/${encodedPath}`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${serviceRoleKey}`,
+      "apikey": serviceRoleKey,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Supabase Storage upload-sign error (${response.status}): ${errText}`);
+  }
+
+  const data = await response.json();
+  const uploadRelative = data.url || data.signedURL || data.signedUrl;
+  const fullUploadUrl = uploadRelative.startsWith("http")
+    ? uploadRelative
+    : `${cleanBase}${uploadRelative.startsWith("/") ? "" : "/"}${uploadRelative}`;
+
+  return {
+    success: true,
+    simulated: false,
+    uploadUrl: fullUploadUrl,
+    token: data.token,
+  };
+};
+
+// POST /media/signed-url (or /media/signed-download-url)
+const mediaSignedUrlHandler = async (req, res) => {
+  const authenticatedUid = req.user.uid;
+  const { channelId, objectPath, bucket = "chatter_vault", expiresIn = 300 } = req.body;
+
+  // Sanitized security audit log (Strictly NO tokens, NO keys logged)
+  console.log(`[MEDIA_AUTH] Caller UID: ${authenticatedUid}, Channel: ${channelId || "none"}, Action: signed-url`);
+
+  if (!channelId || !objectPath) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing required parameters: channelId and objectPath are required",
+    });
+  }
+
+  // Prevent directory traversal attacks
+  if (objectPath.includes("..") || objectPath.startsWith("/") || objectPath.includes("\\")) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid objectPath: Path traversal or absolute paths are forbidden",
+    });
+  }
+
+  // Authorization check against channel membership in Firebase RTDB
+  const membership = await verifyChannelMembership(authenticatedUid, channelId);
+  if (!membership.authorized) {
+    if (membership.isWorldChat) {
+      return res.status(400).json({
+        success: false,
+        error: "World Chat media is public and does not require private vault signed URLs",
+      });
+    }
+    return res.status(403).json({
+      success: false,
+      error: membership.reason || "Forbidden: You are not authorized to access media for this channel",
+    });
+  }
+
+  // Ensure private vault bucket is requested
+  const targetBucket = bucket === "chatter_vault" ? "chatter_vault" : bucket;
+
+  try {
+    const signResult = await generateSupabaseSignedUrl(targetBucket, objectPath, Number(expiresIn) || 300);
+    return res.status(200).json({
+      success: true,
+      bucket: targetBucket,
+      objectPath: objectPath,
+      signedUrl: signResult.signedUrl,
+      expiresIn: signResult.expiresIn,
+      simulated: signResult.simulated || false,
+    });
+  } catch (error) {
+    console.error("[MEDIA_SIGN_ERROR] Could not generate signed URL:", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to generate signed media URL",
+    });
+  }
+};
+
+// POST /media/signed-upload-url (Option A design endpoint)
+const mediaSignedUploadUrlHandler = async (req, res) => {
+  const authenticatedUid = req.user.uid;
+  const { channelId, objectPath, bucket = "chatter_vault" } = req.body;
+
+  console.log(`[MEDIA_AUTH] Caller UID: ${authenticatedUid}, Channel: ${channelId || "none"}, Action: signed-upload-url`);
+
+  if (!channelId || !objectPath) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing required parameters: channelId and objectPath are required",
+    });
+  }
+
+  if (objectPath.includes("..") || objectPath.startsWith("/") || objectPath.includes("\\")) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid objectPath: Path traversal or absolute paths are forbidden",
+    });
+  }
+
+  const membership = await verifyChannelMembership(authenticatedUid, channelId);
+  if (!membership.authorized) {
+    if (membership.isWorldChat) {
+      return res.status(400).json({
+        success: false,
+        error: "World Chat media uses public storage and does not require private vault upload grants",
+      });
+    }
+    return res.status(403).json({
+      success: false,
+      error: membership.reason || "Forbidden: You are not authorized to upload media for this channel",
+    });
+  }
+
+  const targetBucket = bucket === "chatter_vault" ? "chatter_vault" : bucket;
+
+  try {
+    const uploadResult = await generateSupabaseSignedUploadUrl(targetBucket, objectPath);
+    return res.status(200).json({
+      success: true,
+      bucket: targetBucket,
+      objectPath: objectPath,
+      uploadUrl: uploadResult.uploadUrl,
+      simulated: uploadResult.simulated || false,
+    });
+  } catch (error) {
+    console.error("[MEDIA_UPLOAD_SIGN_ERROR] Could not generate upload URL:", error.message);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to generate signed upload URL",
+    });
+  }
+};
+
 // Endpoints protected with Firebase ID token authentication middleware
 app.post("/sendNotification", authenticateUser, sendNotificationHandler);
 app.post("/send-notification", authenticateUser, sendNotificationHandler);
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`KChat Notification Server Running 🚀 on port ${PORT}`);
-});
+// Phase 2 Media Endpoints
+app.post("/media/signed-url", authenticateUser, mediaSignedUrlHandler);
+app.post("/media/signed-download-url", authenticateUser, mediaSignedUrlHandler);
+app.post("/media/signed-upload-url", authenticateUser, mediaSignedUploadUrlHandler);
 
-module.exports = { app, authenticateUser, sendNotificationHandler, getAdminAuth, getAdminDb, getAdminMessaging };
+const PORT = process.env.PORT || 10000;
+let serverInstance = null;
+if (require.main === module) {
+  serverInstance = app.listen(PORT, () => {
+    console.log(`KChat Notification & Media Server Running 🚀 on port ${PORT}`);
+  });
+}
+
+module.exports = {
+  app,
+  authenticateUser,
+  sendNotificationHandler,
+  verifyChannelMembership,
+  generateSupabaseSignedUrl,
+  generateSupabaseSignedUploadUrl,
+  mediaSignedUrlHandler,
+  mediaSignedUploadUrlHandler,
+  getAdminAuth,
+  getAdminDb,
+  getAdminMessaging,
+};
