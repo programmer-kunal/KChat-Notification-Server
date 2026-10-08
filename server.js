@@ -235,6 +235,29 @@ const verifyChannelMembership = async (authenticatedUid, channelId) => {
 };
 
 /**
+ * Safely validates objectPath to prevent directory traversal, absolute paths, backslashes, empty, or malformed paths.
+ */
+const validateObjectPath = (path) => {
+  if (!path || typeof path !== "string" || path.trim().length === 0) {
+    return { valid: false, error: "Missing or empty objectPath" };
+  }
+  const trimmed = path.trim();
+  if (
+    trimmed.startsWith("/") ||
+    trimmed.includes("\\") ||
+    trimmed.includes("..") ||
+    trimmed.includes("//") ||
+    /[\x00-\x1F\x7F]/.test(trimmed)
+  ) {
+    return {
+      valid: false,
+      error: "Invalid objectPath: Path traversal, absolute paths, backslashes, or malformed paths are forbidden",
+    };
+  }
+  return { valid: true, sanitizedPath: trimmed };
+};
+
+/**
  * Generates a short-lived Supabase signed URL using service-role credentials.
  * Never logs credentials, private keys, or the generated token.
  */
@@ -242,21 +265,12 @@ const generateSupabaseSignedUrl = async (bucket, objectPath, expiresIn = 300) =>
   const supabaseUrl = process.env.SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  const sanitizedPath = objectPath.replace(/^\/+/, "");
-
   if (!supabaseUrl || !serviceRoleKey) {
-    // Local testing / staging fallback when service-role key is not yet set in environment
-    const base = (supabaseUrl || "https://cqdnbxdwrjqmtvwdgxtr.supabase.co").replace(/\/+$/, "");
-    return {
-      success: true,
-      simulated: true,
-      signedUrl: `${base}/storage/v1/object/sign/${bucket}/${encodeURIComponent(sanitizedPath)}?token=mock_signed_token_${Date.now()}&expires=${Math.floor(Date.now() / 1000) + expiresIn}`,
-      expiresIn,
-    };
+    throw new Error("Server configuration error: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not configured");
   }
 
   const cleanBase = supabaseUrl.replace(/\/+$/, "");
-  const encodedPath = encodeURIComponent(sanitizedPath).replace(/%2F/g, "/");
+  const encodedPath = encodeURIComponent(objectPath).replace(/%2F/g, "/");
   const endpoint = `${cleanBase}/storage/v1/object/sign/${bucket}/${encodedPath}`;
 
   const response = await fetch(endpoint, {
@@ -282,7 +296,6 @@ const generateSupabaseSignedUrl = async (bucket, objectPath, expiresIn = 300) =>
 
   return {
     success: true,
-    simulated: false,
     signedUrl: fullSignedUrl,
     expiresIn,
   };
@@ -295,20 +308,12 @@ const generateSupabaseSignedUploadUrl = async (bucket, objectPath) => {
   const supabaseUrl = process.env.SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  const sanitizedPath = objectPath.replace(/^\/+/, "");
-
   if (!supabaseUrl || !serviceRoleKey) {
-    const base = (supabaseUrl || "https://cqdnbxdwrjqmtvwdgxtr.supabase.co").replace(/\/+$/, "");
-    return {
-      success: true,
-      simulated: true,
-      uploadUrl: `${base}/storage/v1/object/upload/sign/${bucket}/${encodeURIComponent(sanitizedPath)}?token=mock_upload_token_${Date.now()}`,
-      token: `mock_upload_token_${Date.now()}`,
-    };
+    throw new Error("Server configuration error: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not configured");
   }
 
   const cleanBase = supabaseUrl.replace(/\/+$/, "");
-  const encodedPath = encodeURIComponent(sanitizedPath).replace(/%2F/g, "/");
+  const encodedPath = encodeURIComponent(objectPath).replace(/%2F/g, "/");
   const endpoint = `${cleanBase}/storage/v1/object/upload/sign/${bucket}/${encodedPath}`;
 
   const response = await fetch(endpoint, {
@@ -333,7 +338,6 @@ const generateSupabaseSignedUploadUrl = async (bucket, objectPath) => {
 
   return {
     success: true,
-    simulated: false,
     uploadUrl: fullUploadUrl,
     token: data.token,
   };
@@ -342,27 +346,38 @@ const generateSupabaseSignedUploadUrl = async (bucket, objectPath) => {
 // POST /media/signed-url (or /media/signed-download-url)
 const mediaSignedUrlHandler = async (req, res) => {
   const authenticatedUid = req.user.uid;
-  const { channelId, objectPath, bucket = "chatter_vault", expiresIn = 300 } = req.body;
+  const { channelId, objectPath, bucket, expiresIn = 300 } = req.body;
 
   // Sanitized security audit log (Strictly NO tokens, NO keys logged)
   console.log(`[MEDIA_AUTH] Caller UID: ${authenticatedUid}, Channel: ${channelId || "none"}, Action: signed-url`);
 
-  if (!channelId || !objectPath) {
+  // 1. Private Bucket Enforcement: only chatter_vault is permitted
+  if (bucket && bucket !== "chatter_vault") {
     return res.status(400).json({
       success: false,
-      error: "Missing required parameters: channelId and objectPath are required",
+      error: "Invalid bucket: Only 'chatter_vault' is allowed for private media operations",
+    });
+  }
+  const targetBucket = "chatter_vault";
+
+  if (!channelId) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing required parameter: channelId is required",
     });
   }
 
-  // Prevent directory traversal attacks
-  if (objectPath.includes("..") || objectPath.startsWith("/") || objectPath.includes("\\")) {
+  // 2. Object Path Validation
+  const pathValidation = validateObjectPath(objectPath);
+  if (!pathValidation.valid) {
     return res.status(400).json({
       success: false,
-      error: "Invalid objectPath: Path traversal or absolute paths are forbidden",
+      error: pathValidation.error,
     });
   }
+  const cleanObjectPath = pathValidation.sanitizedPath;
 
-  // Authorization check against channel membership in Firebase RTDB
+  // 3. Authorization check against channel membership in Firebase RTDB
   const membership = await verifyChannelMembership(authenticatedUid, channelId);
   if (!membership.authorized) {
     if (membership.isWorldChat) {
@@ -377,18 +392,14 @@ const mediaSignedUrlHandler = async (req, res) => {
     });
   }
 
-  // Ensure private vault bucket is requested
-  const targetBucket = bucket === "chatter_vault" ? "chatter_vault" : bucket;
-
   try {
-    const signResult = await generateSupabaseSignedUrl(targetBucket, objectPath, Number(expiresIn) || 300);
+    const signResult = await generateSupabaseSignedUrl(targetBucket, cleanObjectPath, Number(expiresIn) || 300);
     return res.status(200).json({
       success: true,
       bucket: targetBucket,
-      objectPath: objectPath,
+      objectPath: cleanObjectPath,
       signedUrl: signResult.signedUrl,
       expiresIn: signResult.expiresIn,
-      simulated: signResult.simulated || false,
     });
   } catch (error) {
     console.error("[MEDIA_SIGN_ERROR] Could not generate signed URL:", error.message);
@@ -402,24 +413,37 @@ const mediaSignedUrlHandler = async (req, res) => {
 // POST /media/signed-upload-url (Option A design endpoint)
 const mediaSignedUploadUrlHandler = async (req, res) => {
   const authenticatedUid = req.user.uid;
-  const { channelId, objectPath, bucket = "chatter_vault" } = req.body;
+  const { channelId, objectPath, bucket } = req.body;
 
   console.log(`[MEDIA_AUTH] Caller UID: ${authenticatedUid}, Channel: ${channelId || "none"}, Action: signed-upload-url`);
 
-  if (!channelId || !objectPath) {
+  // 1. Private Bucket Enforcement: only chatter_vault is permitted
+  if (bucket && bucket !== "chatter_vault") {
     return res.status(400).json({
       success: false,
-      error: "Missing required parameters: channelId and objectPath are required",
+      error: "Invalid bucket: Only 'chatter_vault' is allowed for private media operations",
+    });
+  }
+  const targetBucket = "chatter_vault";
+
+  if (!channelId) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing required parameter: channelId is required",
     });
   }
 
-  if (objectPath.includes("..") || objectPath.startsWith("/") || objectPath.includes("\\")) {
+  // 2. Object Path Validation
+  const pathValidation = validateObjectPath(objectPath);
+  if (!pathValidation.valid) {
     return res.status(400).json({
       success: false,
-      error: "Invalid objectPath: Path traversal or absolute paths are forbidden",
+      error: pathValidation.error,
     });
   }
+  const cleanObjectPath = pathValidation.sanitizedPath;
 
+  // 3. Authorization check against channel membership in Firebase RTDB
   const membership = await verifyChannelMembership(authenticatedUid, channelId);
   if (!membership.authorized) {
     if (membership.isWorldChat) {
@@ -434,16 +458,13 @@ const mediaSignedUploadUrlHandler = async (req, res) => {
     });
   }
 
-  const targetBucket = bucket === "chatter_vault" ? "chatter_vault" : bucket;
-
   try {
-    const uploadResult = await generateSupabaseSignedUploadUrl(targetBucket, objectPath);
+    const uploadResult = await generateSupabaseSignedUploadUrl(targetBucket, cleanObjectPath);
     return res.status(200).json({
       success: true,
       bucket: targetBucket,
-      objectPath: objectPath,
+      objectPath: cleanObjectPath,
       uploadUrl: uploadResult.uploadUrl,
-      simulated: uploadResult.simulated || false,
     });
   } catch (error) {
     console.error("[MEDIA_UPLOAD_SIGN_ERROR] Could not generate upload URL:", error.message);
